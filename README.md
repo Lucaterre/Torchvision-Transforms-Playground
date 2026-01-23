@@ -6,10 +6,10 @@
 [![Hugging Face Spaces](https://img.shields.io/badge/Hugging%20Face-Spaces-yellow)](https://huggingface.co/spaces/lterriel/Torchvision-Transforms-Playground)
 ![License: MIT](https://img.shields.io/badge/License-MIT-black.svg)
 
-Interactive sandbox to explore **torchvision transforms** on your images:
+Interactive sandbox to explore torchvision transforms on your images:
 - Upload one or multiple images
 - Enable/disable transforms and tweak parameters
-- Preview one example per enabled transform + a final **MIX** pipeline (multiple random variants)
+- Preview one example per enabled transform + a final MIX pipeline (multiple random variants)
 - Export a ready-to-use `torchvision.transforms.v2.Compose` code snippet
 - Switch UI language (EN/FR)
 
