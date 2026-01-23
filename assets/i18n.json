@@ -1,0 +1,60 @@
+{
+  "EN": {
+    "app_title": "Torchvision Transforms Playground",
+    "app_subtitles": [
+      "Explore transformations with [torchvision](https://docs.pytorch.org/vision/stable/transforms) and generate a ready-to-use pipeline. This interactive sandbox helps you clearly see the actual effect of transformations (e.g. filters) on your images, and fine-tune your settings before integrating them into the computer vision model training (e.g. data augmentation)."
+    ],
+    "language_label": "Language",
+    "subtitle_label": "Description",
+    "disable_all": "Disable all transforms",
+    "globals_title": "Global settings",
+    "variants_label": "MIX variants per image",
+    "seed_label": "Seed",
+    "reseed_label": "Re-seed each variant (reproducible)",
+    "status_label": "Active sections",
+    "code_label": "Torchvision Compose code (live)",
+    "upload_section": "1) Upload images",
+    "upload_label": "Upload (multi-images)",
+    "apply": "Generate (1 example / transform + FINAL MIX)",
+    "results_section": "2) Results",
+    "results_label": "Results",
+    "sidebar_title": "Controls",
+    "docs_prefix": "Docs:",
+    "sections": {
+      "geometric": "Geometric",
+      "photometric": "Photometric",
+      "policies": "Auto-Augmentation policies",
+      "random_applied": "Randomly-applied",
+      "tensor_bonus": "Miscellaneous, Bonus"
+    }
+  },
+  "FR": {
+    "app_title": "Torchvision Transforms Playground",
+    "app_subtitles": [
+      "Explorer les transformations avec [torchvision](https://docs.pytorch.org/vision/stable/transforms) et générer une pipeline prête à l’emploi.\n Ce bac à sable vous aide à voir concrètement l’effet des transformations (ex. filtres) sur vos images, et à ajuster vos réglages avant de les intégrer à l’entraînement d’un modèle de vision par ordinateur (ex. augmentation de données)."
+    ],
+    "language_label": "Langue",
+    "subtitle_label": "Description",
+    "disable_all": "Tout désactiver",
+    "globals_title": "Paramètres généraux",
+    "variants_label": "Variantes (MIX) par image",
+    "seed_label": "Seed",
+    "reseed_label": "Re-seed à chaque variante (reproductible)",
+    "status_label": "Sections actives",
+    "code_label": "Code torchvision Compose (live)",
+    "upload_section": "1) Déposer des images",
+    "upload_label": "Upload (multi-images)",
+    "apply": "Générer (1 exemple / transformation + MIX FINAL)",
+    "results_section": "2) Résultats",
+    "results_label": "Résultats",
+    "sidebar_title": "Contrôles",
+    "docs_prefix": "Doc :",
+    "sections": {
+      "geometric": "Géométriques",
+      "photometric": "Photométriques",
+      "policies": "Politiques d'auto-augmentation",
+      "random_applied": "Transformations appliquées aléatoirement",
+      "tensor_bonus": "Divers, Bonus"
+    }
+  }
+}

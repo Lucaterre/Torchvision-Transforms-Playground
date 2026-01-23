@@ -1,0 +1,41 @@
+
+
+/* Sidebar: left scrollbar*/
+#controls_sidebar { direction: rtl; }
+#controls_sidebar .gr-accordion,
+#controls_sidebar .gr-markdown,
+#controls_sidebar .gr-form,
+#controls_sidebar .gr-box,
+#controls_sidebar .gr-panel,
+#controls_sidebar .gr-group,
+#controls_sidebar .gr-row,
+#controls_sidebar .gr-column,
+#controls_sidebar .gr-block,
+#controls_sidebar .gr-input,
+#controls_sidebar .gr-button,
+#controls_sidebar .gr-code,
+#controls_sidebar .gr-html,
+#controls_sidebar .gr-checkbox,
+#controls_sidebar .gr-slider,
+#controls_sidebar .gr-dropdown,
+#controls_sidebar .gr-radio,
+#controls_sidebar .gr-number,
+#controls_sidebar .gr-textbox { direction: ltr; }
+
+/* non-visible scrollbar using Webkit */
+#controls_sidebar ::-webkit-scrollbar { width: 10px; }
+#controls_sidebar ::-webkit-scrollbar-track { background: transparent; }
+#controls_sidebar ::-webkit-scrollbar-thumb {
+  background: rgba(100, 116, 139, 0.35);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+#controls_sidebar ::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.55);
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+/* Firefox adapt */
+#controls_sidebar { scrollbar-width: thin; scrollbar-color: rgba(100,116,139,.45) transparent; }
