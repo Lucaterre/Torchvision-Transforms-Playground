@@ -3,6 +3,7 @@
 """
 Torchvision Transforms Playground (Gradio framework)
 
+
 Interactive sandbox to transforming images using torchvision that includes this features:
 - Upload one or multiple images
 - Toggle transforms and tune parameters
@@ -1688,7 +1689,6 @@ class TTPApp:
                         gr.update(
                             value=f"{i18n.get(lang_val, 'docs_prefix')} [{DOCS['tensor_bonus']}]({DOCS['tensor_bonus']})"
                         ),
-                        # ✅ status + code recalculés
                         gr.update(value=status),
                         gr.update(value=code),
                     )
