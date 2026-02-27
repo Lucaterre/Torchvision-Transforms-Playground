@@ -12,6 +12,7 @@ Interactive sandbox to transforming images using torchvision that includes this 
 - Switch UI language (EN/FR)
 - Disable all transforms in one click
 - Quick links to torchvision documentation per section
+- Compute similarity scores (SSIM, MSE, PSNR, aHash, CLIP) between original and transformed images
 
 Usage:
     python3 app.py
@@ -20,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import math
 import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple, Optional
@@ -172,15 +174,360 @@ def ensure_pil(x: Any) -> Image.Image:
     raise TypeError(f"Unsupported output type: {type(x)}")
 
 
+class SemanticSimilarityEngine:
+    """
+    CLIP-based semantic similarity:
+    - Image embeddings normalized
+    - cosine similarity in [-1, 1] (often ~0..1 for related images)
+    """
+
+    def __init__(self, device: Optional[str] = None) -> None:
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self._ready = False
+        self._err: Optional[str] = None
+        self.model = None
+        self.preprocess = None
+        self._init_openclip()
+
+    def _init_openclip(self) -> None:
+        """Initialize the CLIP model and preprocess function from open_clip."""
+        try:
+            import open_clip  # type: ignore
+        except Exception as e:
+            self._ready = False
+            self._err = f"open_clip not available: {e}"
+            return
+
+        try:
+            model_name = "ViT-B-32"
+            pretrained = "laion2b_s34b_b79k"
+            self.model, _, self.preprocess = open_clip.create_model_and_transforms(
+                model_name, pretrained=pretrained
+            )
+            self.model = self.model.to(self.device).eval()
+            self._ready = True
+            self._err = None
+        except Exception as e:
+            self._ready = False
+            self._err = f"open_clip init failed: {e}"
+
+    def is_ready(self) -> bool:
+        """Check if the CLIP model is ready."""
+        return bool(self._ready)
+
+    def error(self) -> Optional[str]:
+        """Get the error message if CLIP is not ready."""
+        return self._err
+
+    @torch.inference_mode()
+    def embed_image(self, im: Image.Image) -> torch.Tensor:
+        """Embed an image using CLIP and return a normalized feature vector.
+
+        :param im: Input image.
+        :type im: PIL.Image.Image
+        :return: Normalized CLIP feature vector.
+        :rtype: torch.Tensor
+        """
+        if not self._ready or self.model is None or self.preprocess is None:
+            raise RuntimeError(self._err or "CLIP not ready")
+        x = self.preprocess(im).unsqueeze(0).to(self.device)
+        feat = self.model.encode_image(x)
+        feat = feat / (feat.norm(dim=-1, keepdim=True) + 1e-12)
+        return feat.squeeze(0).detach().cpu()
+
+    @staticmethod
+    def cosine_from_feats(fa: torch.Tensor, fb: torch.Tensor) -> float:
+        """Compute cosine similarity from two normalized feature vectors.
+
+        :param fa: First feature vector (normalized).
+        :type fa: torch.Tensor
+        :param fb: Second feature vector (normalized).
+        :type fb: torch.Tensor
+        :return: Cosine similarity in [-1, 1].
+        """
+        return float((fa * fb).sum().item())
+
+
+class SimilarityEngine:
+    """
+    Lightweight similarity engine (no external deps):
+    - SSIM (global statistics version, not windowed)
+    - MSE / PSNR
+    - aHash similarity (0..1)
+
+    Pixel-based metrics are computed after resizing both images to sim_size and converting to RGB.
+    """
+
+    def __init__(self, sim_size: int = 256) -> None:
+        self.sim_size = int(sim_size)
+
+    def set_size(self, sim_size: int) -> None:
+        """Set the simulation size for similarity computations.
+
+        :param sim_size: Size to which images will be resized for comparison (e.g. 256).
+        :type sim_size: int
+        """
+        self.sim_size = int(sim_size)
+
+    @staticmethod
+    def _to_rgb(im: Image.Image) -> Image.Image:
+        """Convert an image to RGB if it's not already in that mode.
+
+        :param im: Input image.
+        :type im: PIL.Image.Image
+        :return: RGB image.
+        :rtype: PIL.Image.Image
+        """
+        return im.convert("RGB") if im.mode != "RGB" else im
+
+    def _prep(self, im: Image.Image) -> Tuple[List[float], int]:
+        """
+        Prepare image as flattened float list in [0,1] and number of channels*pixels.
+        We keep it simple/fast without numpy.
+
+        :param im: Input image.
+        :type im: PIL.Image.Image
+        :return: Tuple of (flattened pixel values as list of floats, total number of values).
+        :rtype: Tuple[List[float], int]
+        """
+        im = self._to_rgb(im).resize((self.sim_size, self.sim_size), Image.BILINEAR)
+        px = list(im.get_flattened_data())  # list[(r,g,b)]
+        flat: List[float] = []
+        for r, g, b in px:
+            flat.append(r / 255.0)
+            flat.append(g / 255.0)
+            flat.append(b / 255.0)
+        return flat, len(flat)
+
+    @staticmethod
+    def _mean_var(xs: List[float]) -> Tuple[float, float]:
+        """Compute mean and variance of a list of floats.
+
+        :param xs: List of float values.
+        :type xs: List[float]
+        :return: Tuple of (mean, variance).
+        :rtype: Tuple[float, float]
+        """
+        n = len(xs)
+        if n == 0:
+            return 0.0, 0.0
+        m = sum(xs) / n
+        v = 0.0
+        for x in xs:
+            d = x - m
+            v += d * d
+        v /= n
+        return m, v
+
+    @staticmethod
+    def _cov(xs: List[float], ys: List[float], mx: float, my: float) -> float:
+        """Compute covariance between two lists of floats, given their means.
+
+        :param xs: First list of float values.
+        :type xs: List[float]
+        :param ys: Second list of float values.
+        :type ys: List[float]
+        :param mx: Mean of the first list.
+        :type mx: float
+        :param my: Mean of the second list.
+        :type my: float
+        :return: Covariance value.
+        :rtype: float
+        """
+        n = min(len(xs), len(ys))
+        if n == 0:
+            return 0.0
+        c = 0.0
+        for i in range(n):
+            c += (xs[i] - mx) * (ys[i] - my)
+        return c / n
+
+    def mse(self, a: Image.Image, b: Image.Image) -> float:
+        """Compute Mean Squared Error between two images.
+
+        :param a: First image.
+        :type a: PIL.Image.Image
+        :param b: Second image.
+        :type b: PIL.Image.Image
+        :return: MSE value.
+        :rtype: float
+        """
+        xa, _ = self._prep(a)
+        xb, _ = self._prep(b)
+        n = min(len(xa), len(xb))
+        if n == 0:
+            return 0.0
+        s = 0.0
+        for i in range(n):
+            d = xa[i] - xb[i]
+            s += d * d
+        return s / n
+
+    def psnr(self, a: Image.Image, b: Image.Image) -> float:
+        """Compute Peak Signal-to-Noise Ratio between two images.
+
+        :param a: First image.
+        :type a: PIL.Image.Image
+        :param b: Second image.
+        :type b: PIL.Image.Image
+        :return: PSNR value in decibels.
+        :rtype: float
+        """
+        m = self.mse(a, b)
+        if m <= 1e-12:
+            return 99.0
+        # MAX_I = 1.0 since we use [0,1]
+        return 10.0 * math.log10(1.0 / m)
+
+    def ssim(self, a: Image.Image, b: Image.Image) -> float:
+        """
+        Global SSIM (single window) approximation:
+        SSIM = ((2mxmy + C1)(2cov + C2))/((mx^2+my^2+C1)(vx+vy+C2))
+
+        This is NOT the full windowed SSIM, but is stable + dependency-free.
+
+        :param a: First image.
+        :type a: PIL.Image.Image
+        :param b: Second image.
+        :type b: PIL.Image.Image
+        :return: SSIM value in [-1, 1].
+        :rtype: float
+        """
+        xa, _ = self._prep(a)
+        xb, _ = self._prep(b)
+
+        mx, vx = self._mean_var(xa)
+        my, vy = self._mean_var(xb)
+        cov = self._cov(xa, xb, mx, my)
+
+        # constants for L=1.0
+        c1 = 0.01**2
+        c2 = 0.03**2
+
+        num = (2 * mx * my + c1) * (2 * cov + c2)
+        den = (mx * mx + my * my + c1) * (vx + vy + c2)
+        if den == 0:
+            return 0.0
+        # clamp to [-1, 1] then map to [0,1]? SSIM can be negative.
+        s = num / den
+        return max(-1.0, min(1.0, s))
+
+    @staticmethod
+    def _ahash_bits(im: Image.Image, size: int = 8) -> List[int]:
+        """Compute aHash bits for an image: resize to size*size, convert to grayscale, compute mean, then bits = 1 if pixel >= mean else 0.
+
+        :param im: Input image.
+        :type im: PIL.Image.Image
+        :param size: Size to which image will be resized (default 8 for 64-bit hash).
+        :type size: int
+        :return: List of bits representing the aHash.
+        :rtype: List[int]
+        """
+        g = im.convert("L").resize((size, size), Image.BILINEAR)
+        vals = list(g.get_flattened_data())
+        mean = sum(vals) / len(vals) if vals else 0.0
+        return [1 if v >= mean else 0 for v in vals]
+
+    @staticmethod
+    def _hamming(a: List[int], b: List[int]) -> int:
+        """Compute Hamming distance between two lists of bits.
+
+        :param a: First list of bits.
+        :type a: List[int]
+        :param b: Second list of bits.
+        :type b: List[int]
+        :return: Hamming distance (number of differing bits).
+        :rtype: int
+        """
+        n = min(len(a), len(b))
+        d = 0
+        for i in range(n):
+            if a[i] != b[i]:
+                d += 1
+        d += abs(len(a) - len(b))
+        return d
+
+    def ahash_similarity(self, a: Image.Image, b: Image.Image) -> float:
+        """Compute aHash similarity between two images as 1 - (Hamming distance / 64).
+
+        :param a: First image.
+        :type a: PIL.Image.Image
+        :param b: Second image.
+        :type b: PIL.Image.Image
+        :return: aHash similarity in [0, 1].
+        :rtype: float
+        """
+        ba = self._ahash_bits(a, 8)
+        bb = self._ahash_bits(b, 8)
+        dist = self._hamming(ba, bb)
+        # 64 bits for 8x8
+        return max(0.0, 1.0 - (dist / 64.0))
+
+    def compute(
+        self,
+        ref: Image.Image,
+        out: Image.Image,
+        metrics: List[str],
+    ) -> Dict[str, float]:
+        """
+        Compute selected metrics. Returned keys are stable, used for captions.
+
+        metrics accepted: ["SSIM", "MSE", "PSNR", "aHash"]
+
+        :param ref: Reference image (original).
+        :type ref: PIL.Image.Image
+        :param out: Output image (transformed).
+        :type out: PIL.Image.Image
+        :param metrics: List of metric names to compute.
+        :type metrics: List[str]
+        :return: Dict of metric name to computed value.
+        :rtype: Dict[str, float]
+        """
+        mset = set(metrics or [])
+        scores: Dict[str, float] = {}
+        if "SSIM" in mset:
+            scores["SSIM"] = float(self.ssim(ref, out))
+        if "MSE" in mset:
+            scores["MSE"] = float(self.mse(ref, out))
+        if "PSNR" in mset:
+            scores["PSNR"] = float(self.psnr(ref, out))
+        if "aHash" in mset:
+            scores["aHash"] = float(self.ahash_similarity(ref, out))
+        return scores
+
+    @staticmethod
+    def format_caption(base: str, scores: Dict[str, float]) -> str:
+        """Format a caption string with the base transform name and optional scores.
+
+        :param base: Base caption (e.g. transform name).
+        :type base: str
+        :param scores: Dict of metric name to value.
+        :type scores: Dict[str, float]
+        :return: Formatted caption string.
+        :rtype: str
+        """
+        if not scores:
+            return base
+
+        parts: List[str] = [base]
+        if "SSIM" in scores:
+            parts.append(f"SSIM {scores['SSIM']:.2f}")
+        if "aHash" in scores:
+            parts.append(f"aHash {scores['aHash']:.2f}")
+        if "PSNR" in scores:
+            parts.append(f"PSNR {scores['PSNR']:.1f}dB")
+        if "MSE" in scores:
+            # MSE can be very small; keep compact
+            parts.append(f"MSE {scores['MSE']:.4f}")
+        if "CLIP" in scores:
+            parts.append(f"CLIP {scores['CLIP']:.2f}")
+        return " | ".join(parts)
+
+
 @dataclass
 class TransformItem:
     """
     A single transform descriptor.
-
-    :param name: Display name.
-    :type name: str
-    :param op: Transform object OR a special sentinel string.
-    :type op: Any
     """
 
     name: str
@@ -799,6 +1146,7 @@ class TransformationEngine:
     Apply transforms:
     - one example per enabled transform
     - final MIX pipeline with N variants (define by user)
+    - optional similarity scores vs original
 
     :param factory: TransformFactory instance.
     :type factory: TransformFactory
@@ -806,6 +1154,8 @@ class TransformationEngine:
 
     def __init__(self, factory: TransformFactory) -> None:
         self.factory = factory
+        self.semantic = SemanticSimilarityEngine()
+        self.sim = SimilarityEngine(sim_size=256)
 
     def apply(
         self,
@@ -814,9 +1164,12 @@ class TransformationEngine:
         seed: int,
         reseed_each_variant: bool,
         params: Dict[str, Any],
+        compute_similarity: bool = False,
+        sim_metrics: Optional[List[str]] = None,
+        sim_size: int = 256,
     ) -> List[Dict[str, Any]]:
         """
-        Apply transformations and return HTML.
+        Apply transformations.
 
         :param gallery_in: Gradio gallery value.
         :type gallery_in: Any
@@ -828,12 +1181,43 @@ class TransformationEngine:
         :type reseed_each_variant: bool
         :param params: Transform parameters.
         :type params: Dict[str, Any]
-        :return: Rendered HTML results.
-        :rtype: str
+        :param compute_similarity: Whether to compute similarity scores.
+        :type compute_similarity: bool
+        :param sim_metrics: Metrics list (e.g. ["SSIM","aHash"]).
+        :type sim_metrics: Optional[List[str]]
+        :param sim_size: Resize used for pixel-based scoring.
+        :type sim_size: int
+        :return: Results structure for UI renderer.
+        :rtype: List[Dict[str, Any]]
         """
         images = as_pil_list(gallery_in)
         if not images:
-            return ""
+            return []
+
+        compute_similarity = bool(compute_similarity)
+        sim_metrics = list(sim_metrics or [])
+        self.sim.set_size(int(sim_size))
+
+        # semantic metrics
+        want_clip = "CLIP" in set(sim_metrics or [])
+        clip_ready = self.semantic.is_ready() if want_clip else False
+
+        # If CLIP requested but unavailable, drop it to avoid confusion
+        if want_clip and not clip_ready:
+            sim_metrics = [m for m in sim_metrics if m != "CLIP"]
+            want_clip = False
+
+        def _maybe_add_clip(
+            scores: Dict[str, float],
+            out_img: Image.Image,
+            ref_feat: Optional[torch.Tensor],
+        ) -> None:
+            if not (
+                compute_similarity and want_clip and clip_ready and ref_feat is not None
+            ):
+                return
+            out_feat = self.semantic.embed_image(out_img)
+            scores["CLIP"] = self.semantic.cosine_from_feats(ref_feat, out_feat)
 
         base_seed = int(seed)
         singles = self.factory.build_single_transforms(params)
@@ -841,7 +1225,10 @@ class TransformationEngine:
 
         for idx, img in enumerate(images):
             grouped[idx] = {"original": img, "singles": [], "mix": []}
-
+            # Cache CLIP embedding for the original image (once per image)
+            ref_feat: Optional[torch.Tensor] = None
+            if compute_similarity and want_clip and clip_ready:
+                ref_feat = self.semantic.embed_image(img)
             # one example per transform
             for item in singles:
                 tname, tform = item.name, item.op
@@ -853,26 +1240,49 @@ class TransformationEngine:
                 if tname == "FiveCrop":
                     y = tform(img)  # tuple of 5
                     for i, crop in enumerate(y):
-                        grouped[idx]["singles"].append(
-                            (f"FiveCrop #{i + 1}", ensure_pil(crop))
-                        )
+                        crop_pil = ensure_pil(crop)
+                        cap = f"FiveCrop #{i + 1}"
+                        if compute_similarity:
+                            scores = self.sim.compute(img, crop_pil, sim_metrics)
+                            _maybe_add_clip(scores, crop_pil, ref_feat)
+                            cap = self.sim.format_caption(cap, scores)
+                        grouped[idx]["singles"].append((cap, crop_pil))
                     continue
 
                 if tform == TransformFactory.TENSOR_ERASE_ONLY:
                     tt = self.factory.tensor_only_example(
                         params, TransformFactory.TENSOR_ERASE_ONLY
                     )
-                    grouped[idx]["singles"].append((tname, ensure_pil(tt(img))))
+                    out_pil = ensure_pil(tt(img))
+                    cap = tname
+
+                    if compute_similarity:
+                        scores = self.sim.compute(img, out_pil, sim_metrics)
+                        _maybe_add_clip(scores, out_pil, ref_feat)
+                        cap = self.sim.format_caption(cap, scores)
+                    grouped[idx]["singles"].append((cap, out_pil))
                     continue
 
                 if tform == TransformFactory.TENSOR_NORM_ONLY:
                     tt = self.factory.tensor_only_example(
                         params, TransformFactory.TENSOR_NORM_ONLY
                     )
-                    grouped[idx]["singles"].append((tname, ensure_pil(tt(img))))
+                    out_pil = ensure_pil(tt(img))
+                    cap = tname
+                    if compute_similarity:
+                        scores = self.sim.compute(img, out_pil, sim_metrics)
+                        _maybe_add_clip(scores, out_pil, ref_feat)
+                        cap = self.sim.format_caption(cap, scores)
+                    grouped[idx]["singles"].append((cap, out_pil))
                     continue
 
-                grouped[idx]["singles"].append((tname, ensure_pil(tform(img))))
+                out_pil = ensure_pil(tform(img))
+                cap = tname
+                if compute_similarity:
+                    scores = self.sim.compute(img, out_pil, sim_metrics)
+                    _maybe_add_clip(scores, out_pil, ref_feat)
+                    cap = self.sim.format_caption(cap, scores)
+                grouped[idx]["singles"].append((cap, out_pil))
 
             # + MIX
             pipe = self.factory.build_compose(params)
@@ -887,11 +1297,18 @@ class TransformationEngine:
 
                 # FiveCrop inside Compose returns tuple - for mix we show first crop
                 if isinstance(y, (tuple, list)) and len(y) > 0:
-                    grouped[idx]["mix"].append(
-                        (f"aug #{v + 1} (FiveCrop→#1)", ensure_pil(y[0]))
-                    )
+                    out_pil = ensure_pil(y[0])
+                    cap = f"aug #{v + 1} (FiveCrop→#1)"
                 else:
-                    grouped[idx]["mix"].append((f"aug #{v + 1}", ensure_pil(y)))
+                    out_pil = ensure_pil(y)
+                    cap = f"aug #{v + 1}"
+
+                if compute_similarity:
+                    scores = self.sim.compute(img, out_pil, sim_metrics)
+                    _maybe_add_clip(scores, out_pil, ref_feat)
+                    cap = self.sim.format_caption(cap, scores)
+
+                grouped[idx]["mix"].append((cap, out_pil))
 
         out = []
         for idx, block in grouped.items():
@@ -899,8 +1316,8 @@ class TransformationEngine:
                 {
                     "idx": idx,
                     "original": block["original"],
-                    "singles": block.get("singles", []),  # list[(name, PIL)]
-                    "mix": block.get("mix", []),  # list[(cap, PIL)]
+                    "singles": block.get("singles", []),  # list[(caption, PIL)]
+                    "mix": block.get("mix", []),  # list[(caption, PIL)]
                 }
             )
         return out
@@ -927,11 +1344,6 @@ class TTPApp:
         self.i18n = i18n
         self.engine = engine
         self.codegen = codegen
-
-        # cache (for future?)
-        # self._cache_key = None
-        # self._cache_singles = None
-        # self._cache_pipe = None
 
         # populated when building UI
         self._toggles: List[gr.Checkbox] = []
@@ -987,11 +1399,11 @@ class TTPApp:
 
         return f"""
         <div style="font-size:14px;line-height:1.6">
-          <div>{status_dot(active_geo)}<b>{self.i18n.section(lang, 'geometric')}</b></div>
-          <div>{status_dot(active_photo)}<b>{self.i18n.section(lang, 'photometric')}</b></div>
-          <div>{status_dot(active_aug)}<b>{self.i18n.section(lang, 'policies')}</b></div>
-          <div>{status_dot(active_randomly)}<b>{self.i18n.section(lang, 'random_applied')}</b></div>
-          <div>{status_dot(active_tensor)}<b>{self.i18n.section(lang, 'tensor_bonus')}</b></div>
+          <div>{status_dot(active_geo)}<b>{self.i18n.section(lang, "geometric")}</b></div>
+          <div>{status_dot(active_photo)}<b>{self.i18n.section(lang, "photometric")}</b></div>
+          <div>{status_dot(active_aug)}<b>{self.i18n.section(lang, "policies")}</b></div>
+          <div>{status_dot(active_randomly)}<b>{self.i18n.section(lang, "random_applied")}</b></div>
+          <div>{status_dot(active_tensor)}<b>{self.i18n.section(lang, "tensor_bonus")}</b></div>
         </div>
         """
 
@@ -1139,9 +1551,13 @@ class TTPApp:
             "tensor_bonus": "https://docs.pytorch.org/vision/stable/transforms.html#id6",
         }
 
+        # i18n fallbacks (so your app still works even if i18n.json isn't updated yet)
+        def _t(lang_key: str, key: str, default: str) -> str:
+            v = i18n.get(lang_key, key, default=default)
+            return v if v else default
+
         with gr.Blocks(title=i18n.get("EN", "app_title")) as demo:
             # Header (centered title + subtitle + language)
-
             title_md = gr.Markdown(value=f"# {i18n.get('EN', 'app_title')}")
             desc_md = gr.Markdown(value=f"### {i18n.subtitles('EN')[0]}")
 
@@ -1159,6 +1575,34 @@ class TTPApp:
                 reseed_each_variant = gr.Checkbox(
                     value=True, label=i18n.get("EN", "reseed_label")
                 )
+
+                # ---- Similarity controls (v2.0.0) ----
+                sim_title = gr.Markdown(f"### {_t('EN', 'sim_title', 'Similarity')}")
+                compute_similarity = gr.Checkbox(
+                    value=False,
+                    label=_t("EN", "sim_enable_label", "Compute similarity scores"),
+                )
+                sim_metrics = gr.CheckboxGroup(
+                    ["SSIM", "aHash", "PSNR", "MSE", "CLIP"],
+                    value=["SSIM", "aHash", "CLIP"],
+                    label=_t("EN", "sim_metrics_label", "Metrics"),
+                )
+                sim_size = gr.Slider(
+                    64,
+                    512,
+                    value=256,
+                    step=16,
+                    label=_t("EN", "sim_size_label", "Score resize (px)"),
+                )
+
+                acc_sim_about = gr.Accordion(
+                    label=_t("EN", "sim_about_title", "About similarity scores"),
+                    open=False,
+                )
+                with acc_sim_about:
+                    sim_about_md = gr.Markdown(
+                        value=i18n.get("EN", "sim_about_md", default="")
+                    )
 
                 disable_all_btn = gr.Button(i18n.get("EN", "disable_all"))
                 status_html = gr.HTML(label=i18n.get("EN", "status_label"))
@@ -1402,9 +1846,19 @@ class TTPApp:
                 )
 
                 apply_btn = gr.Button(i18n.get("EN", "apply"), variant="primary")
+                spinner_md = gr.Markdown("⏳ Applying transforms…", visible=False)
                 results_state = gr.State([])
                 results_title_md = gr.Markdown(
                     f"## {i18n.get('EN', 'results_section')}"
+                )
+
+                # A small legend for scores
+                results_legend_md = gr.Markdown(
+                    value=_t(
+                        "EN",
+                        "sim_legend_md",
+                        "Scores appear in captions when enabled (e.g. `SSIM 0.82 | aHash 0.95`). See **About similarity scores** in the sidebar.",
+                    )
                 )
 
                 @gr.render(inputs=results_state)
@@ -1422,16 +1876,11 @@ class TTPApp:
 
                     for item in data:
                         with gr.Accordion(label=f"Image #{item['idx']}", open=True):
-                            # 1 container == 1 gallery (original + singles + mix)
                             tiles = []
                             tiles.append((item["original"], "Original"))
-
-                            # singles: list[(name, PIL)]
                             tiles += [
-                                (im, name) for (name, im) in item.get("singles", [])
+                                (im, cap) for (cap, im) in item.get("singles", [])
                             ]
-
-                            # mix: list[(cap, PIL)]
                             tiles += [(im, cap) for (cap, im) in item.get("mix", [])]
 
                             gr.Gallery(
@@ -1565,16 +2014,6 @@ class TTPApp:
 
                 # this for live updates of status + code
                 def _update_all(lang_val: str, *vals: Any) -> Tuple[str, str]:
-                    """
-                    Update status HTML + code preview.
-
-                    :param lang_val: language code.
-                    :type lang_val: str
-                    :param vals: values from Gradio components.
-                    :type vals: Any
-                    :return: Tuple of (status HTML, code preview).
-                    :rtype: Tuple[str, str]
-                    """
                     p = self._collect_params(*vals)
                     status = self._active_sections_html(lang_val, p)
                     code = self.codegen.to_code(p)
@@ -1601,48 +2040,63 @@ class TTPApp:
 
                 # --- apply button ---
                 def _apply(
-                    gallery: Any, nvar: int, sd: int, reseed: bool, *vals: Any
-                ) -> str:
-                    """
-                    Apply transformations.
-
-                    :param gallery: the input gallery.
-                    :type gallery: Any
-                    :param nvar: number of variants.
-                    :type nvar: int
-                    :param sd: seed.
-                    :type sd: int
-                    :param reseed: whether to reseed each variant.
-                    :type reseed: bool
-                    :param vals: values from Gradio components.
-                    :type vals: Any
-                    :return: Rendered HTML results.
-                    :rtype: str
-                    """
+                    gallery: Any,
+                    nvar: int,
+                    sd: int,
+                    reseed: bool,
+                    sim_on: bool,
+                    metrics: List[str],
+                    sim_sz: int,
+                    *vals: Any,
+                ) -> List[Dict[str, Any]]:
                     p = self._collect_params(*vals)
-
                     return self.engine.apply(
-                        gallery, int(nvar), int(sd), bool(reseed), p
+                        gallery,
+                        int(nvar),
+                        int(sd),
+                        bool(reseed),
+                        p,
+                        compute_similarity=bool(sim_on),
+                        sim_metrics=list(metrics or []),
+                        sim_size=int(sim_sz),
                     )
 
-                apply_btn.click(
-                    fn=_apply,
-                    inputs=[gallery_in, n_variants, seed, reseed_each_variant]
-                    + self._params_inputs,
-                    outputs=[results_state],
+                def _show_spinner():
+                    # show spinner + disable button
+                    return gr.update(visible=True), gr.update(interactive=False)
+
+                def _hide_spinner():
+                    # hide spinner + re-enable button
+                    return gr.update(visible=False), gr.update(interactive=True)
+
+                (
+                    apply_btn.click(
+                        fn=_show_spinner,
+                        inputs=[],
+                        outputs=[spinner_md, apply_btn],
+                    )
+                    .then(
+                        fn=_apply,
+                        inputs=[
+                            gallery_in,
+                            n_variants,
+                            seed,
+                            reseed_each_variant,
+                            compute_similarity,
+                            sim_metrics,
+                            sim_size,
+                        ]
+                        + self._params_inputs,
+                        outputs=[results_state],
+                    )
+                    .then(
+                        fn=_hide_spinner,
+                        inputs=[],
+                        outputs=[spinner_md, apply_btn],
+                    )
                 )
 
                 def _on_lang_change(lang_val: str, *vals: Any):
-                    """
-                    Handle language change: update UI + status + code.
-
-                    :param lang_val: language code.
-                    :type lang_val: str
-                    :param vals: values from Gradio components.
-                    :type vals: Any
-                    :return: Updated components.
-                    :rtype: Tuple[gr.update, ...]
-                    """
                     # updates UI
                     t_upd, desc_upd = self._set_language(lang_val)
 
@@ -1651,6 +2105,15 @@ class TTPApp:
                     status = self._active_sections_html(lang_val, p)
                     code = self.codegen.to_code(p)
 
+                    about_default = ""
+                    about_md = i18n.get(lang_val, "sim_about_md", default=about_default)
+
+                    legend_default = (
+                        "Scores appear in captions when enabled (e.g. `SSIM 0.82 | aHash 0.95`). See **About similarity scores** in the sidebar."
+                        if lang_val == "EN"
+                        else "Les scores apparaissent dans les légendes quand activés (ex : `SSIM 0.82 | aHash 0.95`). Voir **À propos des scores** dans la sidebar."
+                    )
+
                     return (
                         # header
                         t_upd,
@@ -1658,6 +2121,28 @@ class TTPApp:
                         # globals
                         gr.update(value=f"### {i18n.get(lang_val, 'globals_title')}"),
                         gr.update(label=i18n.get(lang_val, "language_label")),
+                        # similarity labels
+                        gr.update(
+                            value=f"### {_t(lang_val, 'sim_title', 'Similarity')}"
+                        ),
+                        gr.update(
+                            label=_t(
+                                lang_val,
+                                "sim_enable_label",
+                                "Compute similarity scores",
+                            )
+                        ),
+                        gr.update(label=_t(lang_val, "sim_metrics_label", "Metrics")),
+                        gr.update(
+                            label=_t(lang_val, "sim_size_label", "Score resize (px)")
+                        ),
+                        gr.update(
+                            label=_t(
+                                lang_val, "sim_about_title", "About similarity scores"
+                            )
+                        ),
+                        gr.update(value=about_md),
+                        # rest
                         gr.update(value=i18n.get(lang_val, "disable_all")),
                         gr.update(label=i18n.get(lang_val, "variants_label")),
                         gr.update(label=i18n.get(lang_val, "seed_label")),
@@ -1667,6 +2152,12 @@ class TTPApp:
                         # section titles
                         gr.update(value=f"## {i18n.get(lang_val, 'upload_section')}"),
                         gr.update(value=f"## {i18n.get(lang_val, 'results_section')}"),
+                        gr.update(
+                            value=i18n.get(
+                                lang_val, "sim_legend_md", default=legend_default
+                            )
+                            or legend_default
+                        ),
                         # accordions labels
                         gr.update(label=i18n.section(lang_val, "geometric")),
                         gr.update(label=i18n.section(lang_val, "photometric")),
@@ -1693,7 +2184,7 @@ class TTPApp:
                         gr.update(value=code),
                     )
 
-                # When language changes: update title/subtitle + some labels
+                # When language changes: update title/subtitle + labels
                 lang.change(
                     fn=_on_lang_change,
                     inputs=[lang] + self._params_inputs,
@@ -1704,6 +2195,14 @@ class TTPApp:
                         # globals
                         globals_title,
                         lang,
+                        # similarity UI
+                        sim_title,
+                        compute_similarity,
+                        sim_metrics,
+                        sim_size,
+                        acc_sim_about,
+                        sim_about_md,
+                        # buttons / labels
                         disable_all_btn,
                         n_variants,
                         seed,
@@ -1713,6 +2212,7 @@ class TTPApp:
                         # section titles
                         upload_title_md,
                         results_title_md,
+                        results_legend_md,
                         # accordion labels
                         acc_geo,
                         acc_photo,

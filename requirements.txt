@@ -2,3 +2,4 @@ gradio==6.4.0
 Pillow==12.1.0
 torch==2.9.1
 torchvision==0.25.0
+open_clip_torch==3.3.0

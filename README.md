@@ -1,7 +1,7 @@
 # Torchvision Transforms Playground (Gradio)
 
 
-[![Black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![ruff](https://img.shields.io/badge/lint-ruff-0A0A0A?logo=ruff&logoColor=white)](https://img.shields.io/badge/lint-ruff-0A0A0A?logo=ruff&logoColor=white)
 [![Gradio](https://img.shields.io/badge/Gradio-app-orange)](https://www.gradio.app/)
 [![Hugging Face Spaces](https://img.shields.io/badge/Hugging%20Face-Spaces-yellow)](https://huggingface.co/spaces/lterriel/Torchvision-Transforms-Playground)
 ![License: MIT](https://img.shields.io/badge/License-MIT-black.svg)
